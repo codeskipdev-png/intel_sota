@@ -1,0 +1,5 @@
+{
+  "feature_spec_version": 1,
+  "hand_feature_dim": 20,
+  "onnx_opset": 17
+}
