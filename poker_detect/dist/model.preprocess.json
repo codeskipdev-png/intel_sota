@@ -1,5 +1,6 @@
 {
   "feature_spec_version": 1,
   "hand_feature_dim": 20,
-  "onnx_opset": 17
+  "onnx_opset": 17,
+  "checkpoint": "C:\\Users\\admin\\Documents\\workspace\\Poker44-subnet_train\\poker_detect\\training\\data\\poker_detect_runs\\default\\best.pt"
 }
