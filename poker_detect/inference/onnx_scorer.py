@@ -39,5 +39,8 @@ class OnnxHandScorer:
             raise ValueError(f"feature dim {x.shape[0]} != expected {self.hand_feature_dim}")
         x = x.reshape(1, -1)
         (logit,) = self._session.run(None, {"hand_features": x})
+        # y_score = torch.sigmoid(torch.tensor(all_logits)).numpy()
+        # logit_f = float(np.asarray(logit).reshape(-1)[0])
+        # prob = 1.0 / (1.0 + np.exp(-logit_f))
         y_score = torch.sigmoid(torch.tensor(logit)).numpy().reshape(-1)[0]
         return float(max(0.0, min(1.0, y_score)))

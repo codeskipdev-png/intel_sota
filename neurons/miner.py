@@ -3,7 +3,6 @@
 # from __future__ import annotations
 
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Tuple
 
@@ -15,7 +14,7 @@ from poker44.utils.model_manifest import (
     evaluate_manifest_compliance,
     manifest_digest,
 )
-from poker44.detect_bots import detect_bots
+from poker_detect.detect_bots import detect_bots
 from poker44.validator.synapse import DetectionSynapse
 
 class Miner(BaseMinerNeuron):

@@ -1,3 +1,22 @@
+"""Standalone ONNX bot detection for custom HTTP servers (e.g. FastAPI).
+
+Mirrors scoring in ``neurons/miner_onnx.py``: same ``OnnxChunkScorer`` and
+threshold (risk >= 0.5 => bot prediction).
+
+Environment (same as the ONNX miner):
+
+- ``POKER44_ONNX_MODEL_PATH`` — path to ``model.onnx`` (required)
+- ``POKER44_ONNX_PREPROCESS_PATH`` — optional ``*.preprocess.json`` (defaults next to ONNX)
+
+On first use, variables are also read from a ``.env`` file next to this module (repo root) if
+``python-dotenv`` is installed. Process managers (PM2, systemd) do **not** inherit shell
+``export``; set env in the PM2 ecosystem ``env`` block or use ``.env``.
+
+Requires inference deps: ``pip install -e ".[detect]"`` or at least ``onnxruntime``.
+
+Run with repo root on ``PYTHONPATH`` (or ``pip install -e .``) so ``poker_detect`` resolves.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -7,6 +26,7 @@ import numpy as np
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 _scorer = None
 _scorer_lock = threading.Lock()
@@ -30,10 +50,17 @@ _get_scorer()
 def detect_bots(
     chunks: List[List[dict[str, Any]]],
 ) -> Tuple[List[float], List[bool]]:
+    """
+    Score each chunk (sequence of hand dicts) with the loaded ONNX model.
+
+    Returns ``(risk_scores, predictions)`` where each prediction is ``True`` if
+    that chunk's bot risk is >= 0.5 (same as the Bittensor ONNX miner).
+    """
     global _scorer
     chunk_list = chunks or []
     if not chunk_list:
         return [], []
+
 
     chunk_score_matrix = [
         [_scorer.score_hand(h or {}) for h in chunk] for chunk in chunk_list
@@ -42,11 +69,11 @@ def detect_bots(
     risk_scores, predictions = [], []
     for chunk_score_row in chunk_score_matrix:
         score_row = np.array(chunk_score_row, np.float32)
-        bot_mask = score_row > 0.5
+        bot_mask = score_row > 0.9
         n_hand = len(score_row)
-        pred = np.sum(bot_mask) / n_hand > 0.5
-        score = np.mean(score_row[bot_mask]) if pred else np.mean(score_row[~bot_mask])
-        risk_scores.append(score.item())
+        pred = np.sum(bot_mask) / n_hand > 0.9
+        score = float(pred)
+        risk_scores.append(score)
         predictions.append(pred.item())
 
     return risk_scores, predictions
@@ -54,6 +81,9 @@ def detect_bots(
 
 
 if __name__ == "__main__":
+    import json
+    from poker44.score.scoring import reward
+
     chunks = [
           [
             {
@@ -271,9 +301,13 @@ if __name__ == "__main__":
             }
           ]
     ]
-
+        
     risk_scores, predictions = detect_bots(chunks)
+    print("\n"+"="*30)
     print(f"risk_scores={risk_scores}")
     print(f"predictions={predictions}")
+
+    
+
 
 
