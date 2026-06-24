@@ -15,6 +15,11 @@ _MEANINGFUL_ACTIONS = ("call", "check", "bet", "raise", "fold")
 
 CHUNK_FEATURE_DIM = HAND_FEATURE_DIM * 4 + 1
 
+# Hand dims used for chunk dispersion (sync with features/batch.py).
+KEY_HAND_FEATURE_DIMS = (3, 4, 5, 7, 15)  # raise, fold, aggression, street_depth, amt_sd
+CHUNK_DISPERSION_DIM = len(KEY_HAND_FEATURE_DIMS) * 2 + 2
+TREE_CHUNK_FEATURE_DIM = CHUNK_FEATURE_DIM + CHUNK_DISPERSION_DIM
+
 
 def _clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
@@ -142,3 +147,39 @@ def chunk_feature_vector(hands: List[Dict[str, Any]]) -> np.ndarray:
     out = np.concatenate([mean, std, vmin, vmax, n_norm]).astype(np.float32)
     assert out.shape[0] == CHUNK_FEATURE_DIM
     return out
+
+
+def chunk_dispersion_vector(hands: List[Dict[str, Any]]) -> np.ndarray:
+    """
+    Chunk-level dispersion (numpy mirror of ``batch_chunk_dispersion_tensor``).
+
+    Captures heterogeneity within a chunk: per-key means, fraction of high-aggression
+    hands, and cross-hand variance — same signal the attention MIL head uses.
+    """
+    if not hands:
+        return np.zeros(CHUNK_DISPERSION_DIM, dtype=np.float32)
+
+    mat = np.stack([hand_feature_vector(h) for h in hands], axis=0)
+    count = float(len(hands))
+    parts: list[float] = []
+
+    for dim_idx in KEY_HAND_FEATURE_DIMS:
+        vals = mat[:, dim_idx]
+        parts.append(float(vals.mean()))
+        parts.append(float((vals > 0.35).sum()) / count)
+
+    centered = mat - mat.mean(axis=0, keepdims=True)
+    per_dim_std = centered.std(axis=0)
+    parts.append(float(per_dim_std.mean()))
+    parts.append(float(per_dim_std.max()))
+
+    out = np.asarray(parts, dtype=np.float32)
+    assert out.shape[0] == CHUNK_DISPERSION_DIM
+    return out
+
+
+def tree_chunk_feature_vector(hands: List[Dict[str, Any]]) -> np.ndarray:
+    """Chunk stats + dispersion for classical classifiers (aligned with neural chunk head)."""
+    return np.concatenate(
+        [chunk_feature_vector(hands), chunk_dispersion_vector(hands)]
+    ).astype(np.float32)

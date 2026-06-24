@@ -10,12 +10,12 @@ from typing import Any, Dict, List, Optional, Protocol
 import numpy as np
 
 from poker_detect.features.extractor import (
-    CHUNK_FEATURE_DIM,
     FEATURE_SPEC_VERSION,
     HAND_FEATURE_DIM,
-    chunk_feature_vector,
+    TREE_CHUNK_FEATURE_DIM,
     hand_feature_vector,
 )
+from poker_detect.features.registry import resolve_tree_feature_spec, tree_feature_vector_for_hands
 from poker_detect.training.calibrate import apply_affine_calibration
 from poker_detect.training.tree_ensemble import (
     TREE_ENSEMBLE_FILENAME,
@@ -147,16 +147,36 @@ class OnnxBlendedChunkScorer:
         self._train_pipelines = bundle.get("train_pipelines") or bundle.get("pipelines")
         if self._train_pipelines is None:
             raise ValueError(f"tree bundle missing pipelines: {bundle_path}")
+        self._tree_feature_dim = int(
+            bundle.get("tree_chunk_feature_dim", TREE_CHUNK_FEATURE_DIM)
+        )
+        self._tree_feature_spec = int(
+            bundle.get(
+                "tree_feature_spec_version",
+                resolve_tree_feature_spec(
+                    tree_chunk_feature_dim=self._tree_feature_dim
+                ).version,
+            )
+        )
 
         self._neural = OnnxChunkModelScorer(onnx_path, preprocess_path=preprocess_path)
+
+    def _tree_feature_vector(self, hands: List[Dict[str, Any]]) -> np.ndarray:
+        return tree_feature_vector_for_hands(
+            hands,
+            feature_spec=self._tree_feature_spec,
+            tree_chunk_feature_dim=self._tree_feature_dim,
+        )
 
     def score_chunk(self, hands: List[Dict[str, Any]]) -> float:
         if not hands:
             return 0.5
         neural = self._neural.score_chunk(hands)
-        feat = chunk_feature_vector(hands).reshape(1, -1)
-        if feat.shape[1] != CHUNK_FEATURE_DIM:
-            raise ValueError(f"chunk feature dim {feat.shape[1]} != {CHUNK_FEATURE_DIM}")
+        feat = self._tree_feature_vector(hands).reshape(1, -1)
+        if feat.shape[1] != self._tree_feature_dim:
+            raise ValueError(
+                f"tree feature dim {feat.shape[1]} != expected {self._tree_feature_dim}"
+            )
         tree_probas = predict_tree_probas(self._train_pipelines, feat)
         blended = blend_scores(
             np.array([neural]),

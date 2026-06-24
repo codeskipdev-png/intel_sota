@@ -15,7 +15,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
 from poker44.score.scoring import reward
-from poker_detect.features.extractor import CHUNK_FEATURE_DIM, chunk_feature_vector
+from poker_detect.features.registry import (
+    DEFAULT_TREE_FEATURE_SPEC,
+    chunk_feature_matrix as registry_chunk_feature_matrix,
+    get_tree_feature_spec,
+    resolve_tree_feature_spec,
+    tree_feature_vector_for_hands,
+)
 from poker_detect.training.calibrate import (
     apply_affine_calibration,
     fit_conservative_blend_calibration,
@@ -82,8 +88,14 @@ def build_tree_pipelines(*, seed: int = 42) -> dict[str, Pipeline]:
     }
 
 
-def chunk_feature_matrix(chunks: list) -> np.ndarray:
-    return np.stack([chunk_feature_vector(c) for c in chunks], axis=0)
+def chunk_feature_matrix(
+    chunks: list,
+    *,
+    use_tree_features: bool = True,
+    feature_spec: int = DEFAULT_TREE_FEATURE_SPEC,
+) -> np.ndarray:
+    del use_tree_features  # trees always use tree_chunk vector; kept for callers
+    return registry_chunk_feature_matrix(chunks, feature_spec=feature_spec)
 
 
 def predict_tree_probas(
@@ -120,6 +132,7 @@ def fit_lodo_tree_ensemble(
     *,
     seed: int = 42,
     min_train_chunks: int = 20,
+    feature_spec: int = DEFAULT_TREE_FEATURE_SPEC,
 ) -> tuple[list[dict[str, Pipeline]], dict[str, np.ndarray]]:
     """
     Leave-one-date-out tree training.
@@ -146,11 +159,13 @@ def fit_lodo_tree_ensemble(
 
         train_chunks = [chunks[int(i)] for i in train_idx]
         train_y = labels[train_idx]
-        pipelines = fit_tree_ensemble_on_chunks(train_chunks, train_y, seed=seed)
+        pipelines = fit_tree_ensemble_on_chunks(
+            train_chunks, train_y, seed=seed, feature_spec=feature_spec
+        )
         fold_pipelines.append(pipelines)
 
         hold_chunks = [chunks[int(i)] for i in hold_idx]
-        X_hold = chunk_feature_matrix(hold_chunks)
+        X_hold = chunk_feature_matrix(hold_chunks, feature_spec=feature_spec)
         probas = predict_tree_probas(pipelines, X_hold)
         for name in TREE_NAMES:
             oof[name][hold_idx] += probas[name]
@@ -161,9 +176,11 @@ def fit_lodo_tree_ensemble(
         oof[name][filled] /= oof_count[filled]
 
     if not fold_pipelines:
-        full = fit_tree_ensemble_on_chunks(chunks, labels, seed=seed)
+        full = fit_tree_ensemble_on_chunks(chunks, labels, seed=seed, feature_spec=feature_spec)
         fold_pipelines = [full]
-        oof = predict_tree_probas(full, chunk_feature_matrix(chunks))
+        oof = predict_tree_probas(
+            full, chunk_feature_matrix(chunks, feature_spec=feature_spec)
+        )
 
     return fold_pipelines, oof
 
@@ -233,9 +250,11 @@ def fit_blend_weights(
 def classical_probas_for_dataset(
     pipelines: Mapping[str, Pipeline],
     dataset: Any,
+    *,
+    feature_spec: int = DEFAULT_TREE_FEATURE_SPEC,
 ) -> dict[str, np.ndarray]:
     """Tree probabilities for a ChunkBenchmarkDataset using pre-fit pipelines."""
-    X = chunk_feature_matrix(dataset.chunks)
+    X = chunk_feature_matrix(dataset.chunks, feature_spec=feature_spec)
     return predict_tree_probas(pipelines, X)
 
 
@@ -243,12 +262,14 @@ def train_classical_on_dataset(
     train_ds: Any,
     *,
     seed: int = 42,
+    feature_spec: int = DEFAULT_TREE_FEATURE_SPEC,
 ) -> dict[str, Pipeline]:
     """Fit XGB + RF + DT on the full train split only (independent of MLP)."""
     return fit_tree_ensemble_on_chunks(
         train_ds.chunks,
         np.asarray(train_ds.labels, dtype=float),
         seed=seed,
+        feature_spec=feature_spec,
     )
 
 
@@ -314,8 +335,9 @@ def fit_tree_ensemble_on_chunks(
     train_labels: np.ndarray,
     *,
     seed: int = 42,
+    feature_spec: int = DEFAULT_TREE_FEATURE_SPEC,
 ) -> dict[str, Pipeline]:
-    X = chunk_feature_matrix(train_chunks)
+    X = chunk_feature_matrix(train_chunks, feature_spec=feature_spec)
     y = np.asarray(train_labels, dtype=float)
     pipelines = build_tree_pipelines(seed=seed)
     for pipe in pipelines.values():
@@ -342,14 +364,18 @@ def save_tree_ensemble_bundle(
     calib_min_ap_ratio: float = 0.95,
     train_metrics: Mapping[str, float] | None = None,
     val_metrics: Mapping[str, float] | None = None,
+    tree_feature_spec: int = DEFAULT_TREE_FEATURE_SPEC,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     bundle_path = out_dir / TREE_ENSEMBLE_FILENAME
+    spec = get_tree_feature_spec(tree_feature_spec)
     payload: dict[str, Any] = {
         "weights": dict(weights),
         "calib_scale": float(calib_scale),
         "calib_shift": float(calib_shift),
         "pipeline_mode": pipeline_mode,
+        "tree_feature_spec_version": spec.version,
+        "tree_chunk_feature_dim": spec.tree_chunk_feature_dim,
     }
     if train_pipelines is not None:
         payload["train_pipelines"] = dict(train_pipelines)
@@ -364,7 +390,9 @@ def save_tree_ensemble_bundle(
     meta = {
         "weights": {k: float(v) for k, v in weights.items()},
         "tree_names": list(TREE_NAMES),
-        "chunk_feature_dim": CHUNK_FEATURE_DIM,
+        "chunk_feature_dim": spec.chunk_feature_dim,
+        "tree_chunk_feature_dim": spec.tree_chunk_feature_dim,
+        "tree_feature_spec_version": spec.version,
         "pipeline_mode": pipeline_mode,
         "lodo_folds": len(lodo_pipelines or []),
         "blend_select_on": blend_select_on,
@@ -426,8 +454,29 @@ class MlpTreeEnsembleScorer:
         self._fold_pipelines: list[dict[str, Pipeline]] | None = bundle.get("lodo_pipelines")
         if self._train_pipelines is None and self._pipelines is None and self._fold_pipelines is None:
             raise ValueError(f"tree bundle missing pipelines: {bundle_path}")
+        self._tree_feature_spec = int(
+            bundle.get(
+                "tree_feature_spec_version",
+                resolve_tree_feature_spec(
+                    tree_chunk_feature_dim=bundle.get("tree_chunk_feature_dim")
+                ).version,
+            )
+        )
+        self._tree_feature_dim = int(
+            bundle.get(
+                "tree_chunk_feature_dim",
+                get_tree_feature_spec(self._tree_feature_spec).tree_chunk_feature_dim,
+            )
+        )
         self._chunk_scores_from_model = chunk_scores_from_model
         self._collate = None
+
+    def _tree_feature_vector(self, hands: list) -> np.ndarray:
+        return tree_feature_vector_for_hands(
+            hands,
+            feature_spec=self._tree_feature_spec,
+            tree_chunk_feature_dim=self._tree_feature_dim,
+        )
 
     def _collate_chunks(self, hands: list):
         from poker_detect.training.jsonl_loader import collate_hand_chunks
@@ -447,7 +496,7 @@ class MlpTreeEnsembleScorer:
             mlp = self._chunk_scores_from_model(self._model, features, mask)
         mlp_score = float(mlp[0].item())
 
-        feat = chunk_feature_vector(hands).reshape(1, -1)
+        feat = self._tree_feature_vector(hands).reshape(1, -1)
         if self._train_pipelines is not None:
             tree_probas = predict_tree_probas(self._train_pipelines, feat)
         elif self._pipelines is not None:
