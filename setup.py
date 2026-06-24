@@ -58,6 +58,7 @@ setup(
     author_email="",
     license="MIT",
     packages=find_packages(),
+    py_modules=["detect_bots"],
     include_package_data=True,
     install_requires=requirements,
     python_requires=">=3.10",

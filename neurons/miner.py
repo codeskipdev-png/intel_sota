@@ -2,10 +2,15 @@
 
 # from __future__ import annotations
 
+import sys
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Tuple
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import bittensor as bt
 
@@ -45,7 +50,7 @@ class Miner(BaseMinerNeuron):
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": "https://github.com/codeskipdev-png/intel_sota",
-                "repo_commit": "81fa414",
+                "repo_commit": "6890b8a",
                 "notes": "Reference heuristic miner shipped with the Poker44 subnet.",
                 "open_source": True,
                 "inference_mode": "remote",
