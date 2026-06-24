@@ -1,35 +1,32 @@
-"""Standalone ONNX bot detection for custom HTTP servers (e.g. FastAPI).
+"""Chunk-level bot detection for HTTP servers and local scripts.
 
-Uses ``OnnxHandScorer`` per hand. Per-chunk risk is the fraction of hands with
-score > 0.8. For each request, sweep a chunk-level threshold ``t`` over
-``[0, 1]`` and pick the ``t`` that makes ``predictions = risk > t`` closest to
-1:1 bot:human (validator-style shuffled batches). Concretely, minimize
-``|bot_count - n / 2|``.
+Loads exported ``model.onnx`` (+ optional ``tree_ensemble.joblib`` sidecar) and scores
+each chunk independently. Predictions follow subnet scoring: ``round(risk_score)``.
 
-Environment (same as the ONNX miner):
+Environment:
 
-- ``POKER44_ONNX_MODEL_PATH`` — path to ``model.onnx`` (required)
-- ``POKER44_ONNX_PREPROCESS_PATH`` — optional ``*.preprocess.json`` (defaults next to ONNX)
+- ``POKER44_ONNX_MODEL_PATH`` — path to ``model.onnx`` (default: ``poker_detect/dist/model.onnx``)
+- ``POKER44_ONNX_PREPROCESS_PATH`` — optional ``*.preprocess.json``
+- ``POKER44_TREE_BUNDLE_PATH`` — optional ``tree_ensemble.joblib`` (default: next to ONNX)
 
-On first use, variables are also read from a ``.env`` file next to this module (repo root) if
-``python-dotenv`` is installed. Process managers (PM2, systemd) do **not** inherit shell
-``export``; set env in the PM2 ecosystem ``env`` block or use ``.env``.
-
-Requires inference deps: ``pip install -e ".[detect]"`` or at least ``onnxruntime``.
-
-Run with repo root on ``PYTHONPATH`` (or ``pip install -e .``) so ``poker_detect`` resolves.
+Requires: ``pip install -e ".[detect]"`` or at least ``onnxruntime`` (+ ``joblib``/``xgboost`` if blended).
 """
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import Any, List, Tuple
+
 import numpy as np
 
+try:
+    from dotenv import load_dotenv
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
 
 _scorer = None
 _scorer_lock = threading.Lock()
@@ -41,113 +38,65 @@ def _get_scorer():
         return _scorer
     with _scorer_lock:
         if _scorer is None:
-            from poker_detect.inference.onnx_scorer import OnnxHandScorer
+            from poker_detect.inference.onnx_scorer import load_detection_scorer_from_env
 
-            onnx_env = _REPO_ROOT / "poker_detect" / "dist" / "model.onnx"
-            onnx_path = Path(onnx_env).expanduser().resolve()
-            _scorer = OnnxHandScorer(onnx_path)
+            _scorer = load_detection_scorer_from_env()
     return _scorer
-
-_get_scorer()
-
-
-_THRESHOLD_GRID = np.linspace(0.0, 1.0, 1001, dtype=np.float32)
-
-
-def _find_balanced_threshold(chunk_risks: List[float]) -> Tuple[float, List[bool]]:
-    n = len(chunk_risks)
-    if n == 0:
-        return 0.5, []
-    risks = np.asarray(chunk_risks, dtype=np.float32)
-    target = n / 2.0
-
-    best_t = float(_THRESHOLD_GRID[0])
-    best_diff = float("inf")
-    for t in _THRESHOLD_GRID:
-        bots = int(np.sum(risks > t))
-        diff = abs(bots - target)
-        if diff < best_diff:
-            best_diff = diff
-            best_t = float(t)
-            if best_diff == 0.0:
-                break
-
-    preds = (risks > best_t).tolist()
-    return best_t, preds
 
 
 def detect_bots(
     chunks: List[List[dict[str, Any]]],
 ) -> Tuple[List[float], List[bool]]:
     """
-    Score each chunk (sequence of hand dicts) with the loaded ONNX model.
+    Score each chunk (list of sanitized hand dicts).
 
-    Returns ``(risk_scores, predictions)``. ``risk_scores[i]`` is the fraction
-    of hands in chunk ``i`` with hand score > 0.8. ``predictions[i] = risk > t``
-    where ``t`` is chosen by a sweep over ``[0, 1]`` to minimize
-    ``|bot_count - n / 2|`` (closest to 1:1).
+    Returns:
+        ``risk_scores`` — float in [0, 1] per chunk (blended + calibrated when configured).
+        ``predictions`` — ``bool(round(risk_score))`` per chunk (subnet convention).
     """
-    global _scorer
     chunk_list = chunks or []
     if not chunk_list:
         return [], []
 
-    chunk_score_matrix = [
-        [_scorer.score_hand(h or {}) for h in chunk] for chunk in chunk_list
+    scorer = _get_scorer()
+    risk_scores = [
+        float(scorer.score_chunk([h or {} for h in chunk]))
+        for chunk in chunk_list
     ]
+    predictions = [bool(round(score)) for score in risk_scores]
+    return risk_scores, predictions
 
-    chunk_risks: List[float] = []
-    for chunk_score_row in chunk_score_matrix:
-        score_row = np.asarray(chunk_score_row, dtype=np.float32)
-        n_hand = len(score_row)
-        if n_hand == 0:
-            chunk_risks.append(0.0)
-        else:
-            chunk_risks.append(float(np.mean(score_row > 0.8)))
 
-    threshold, predictions = _find_balanced_threshold(chunk_risks)
-    print(f"threshold={threshold}")
-    return chunk_risks, predictions
-
+def reset_scorer() -> None:
+    """Clear cached scorer (for tests or hot reload)."""
+    global _scorer
+    with _scorer_lock:
+        _scorer = None
 
 
 if __name__ == "__main__":
     import json
+
     from poker44.score.scoring import reward
 
-    path = Path("C:/Users/admin/Documents/workspace/poker/bt_tool/dataset_maker/benchmark_out/benchmark_2026-05-08.raw.json")
+    path = Path(
+        os.environ.get(
+            "POKER44_BENCHMARK_JSON",
+            "C:/Users/admin/Documents/workspace/poker/bt_tool/dataset_maker/benchmark_out/benchmark_2026-06-23.json",
+        )
+    )
+    if not path.exists():
+        raise SystemExit(f"benchmark not found: {path}")
 
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     for sub_data in data["data"]["chunks"]:
         chunks = sub_data["chunks"]
-        groundTruth = sub_data["groundTruth"]
-
+        ground_truth = sub_data["groundTruth"]
         risk_scores, predictions = detect_bots(chunks)
-        print("\n"+"="*30)
-        print(f"risk_scores={risk_scores}")
+        rew, metrics = reward(np.asarray(risk_scores, dtype=float), np.asarray(ground_truth))
+        print("=" * 40)
+        print(f"reward={rew:.4f} fpr={metrics['fpr']:.4f} recall={metrics['bot_recall']:.4f}")
         print(f"predictions={predictions}")
-        print(f"groundTruth={groundTruth}")
-        print(f"reward={reward(np.array(risk_scores), np.array(groundTruth))}")
-        print(f"accuracy={np.sum(np.array(predictions)==np.array(groundTruth)) / len(chunks)}")
-
-    for i in range(85, 99):
-
-        path = Path(
-            f"C:/Users/admin/Documents/workspace/poker/bt_tool/dataset_maker/benchmark_out/output/chunks_{i+1}.json")
-
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        chunks = data
-
-        risk_scores, predictions = detect_bots(chunks)
-        print("\n" + "=" * 30 + f"chunks {i+1}" + "=" * 30)
-        print(f"risk_scores={risk_scores}")
-        print(f"predictions={predictions}")
-        print(f"sum bots={sum(predictions)}")
-
-
-
-
+        print(f"groundTruth={ground_truth}")

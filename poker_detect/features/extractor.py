@@ -7,10 +7,11 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-FEATURE_SPEC_VERSION = 1
-# HAND_FEATURE_DIM = 20
-HAND_FEATURE_DIM = 17
+FEATURE_SPEC_VERSION = 2
+HAND_FEATURE_DIM = 23
 EPS = 1e-10
+
+_MEANINGFUL_ACTIONS = ("call", "check", "bet", "raise", "fold")
 
 CHUNK_FEATURE_DIM = HAND_FEATURE_DIM * 4 + 1
 
@@ -19,110 +20,110 @@ def _clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
 
-def _mean_std_over_max(vals: List[float]) -> tuple[float, float]:
+def _mean_std_max_norm(vals: List[float], *, max_scale: float) -> tuple[float, float, float]:
     if not vals:
-        return 0.0, 0.0
-    m = float(np.max(vals))
-    d = max(m, EPS)
-    return float(np.mean(vals) / d), float(np.std(vals) / d)
+        return 0.0, 0.0, 0.0
+    arr = np.asarray(vals, dtype=np.float64)
+    peak = max(float(arr.max()), EPS)
+    return (
+        _clamp01(float(arr.mean()) / peak),
+        _clamp01(float(arr.std()) / peak),
+        _clamp01(float(arr.max()) / max_scale),
+    )
 
 
 def hand_feature_vector(hand: Dict[str, Any]) -> np.ndarray:
     """
     Map one sanitized hand dict to a fixed-length float vector.
+
+    Raw inputs mirror the reference heuristic miner (``neurons/miner.py``) so an
+    MLP can learn combining weights instead of hardcoded coefficients. Betting
+    size / pot trajectories are included as extra signal.
+
     Must stay in sync with training export and ONNX miner inference.
     """
     actions = hand.get("actions") or []
     players = hand.get("players") or []
     streets = hand.get("streets") or []
+    outcome = hand.get("outcome") or {}
 
-    counts = Counter(
-        str(a.get("action_type") or "other").strip().lower() for a in actions if isinstance(a, dict)
+    action_counts = Counter(
+        str(a.get("action_type") or "other").strip().lower()
+        for a in actions
+        if isinstance(a, dict)
     )
-    n_act = max(1, len(actions))
+    meaningful = max(
+        1,
+        sum(action_counts.get(kind, 0) for kind in _MEANINGFUL_ACTIONS),
+    )
 
-    def ratio(key: str) -> float:
-        return counts.get(key, 0) / n_act
+    def m_ratio(kind: str) -> float:
+        return action_counts.get(kind, 0) / meaningful
 
-    # vec: List[float] = [
-    #     ratio("call"),
-    #     ratio("check"),
-    #     ratio("bet"),
-    #     ratio("raise"),
-    #     ratio("fold"),
-    #     ratio("all_in"),
-    #     ratio("small_blind"),
-    #     ratio("big_blind"),
-    #     ratio("ante"),
-    #     ratio("other"),
-    #     _clamp01(len(streets) / 4.0),
-    #     _clamp01(min(len(players), 8) / 8.0),
-    # ]
+    call_ratio = m_ratio("call")
+    check_ratio = m_ratio("check")
+    bet_ratio = m_ratio("bet")
+    raise_ratio = m_ratio("raise")
+    fold_ratio = m_ratio("fold")
+
+    street_depth = _clamp01(len(streets) / 3.0)
+    streets_norm = _clamp01(len(streets) / 4.0)
+    showdown_flag = 1.0 if outcome.get("showdown") else 0.0
+
+    player_count_signal = 0.0
+    if players:
+        player_count_signal = _clamp01((6 - min(len(players), 6)) / 4.0)
+    player_count_norm = _clamp01(min(len(players), 8) / 8.0)
+
+    action_count_norm = _clamp01(len(actions) / 20.0)
+    streets_from_actions = {
+        str(a.get("street") or "").strip().lower()
+        for a in actions
+        if isinstance(a, dict) and a.get("street")
+    }
+    unique_streets_norm = _clamp01(len(streets_from_actions) / 4.0)
+
+    amts: List[float] = []
+    pots_before: List[float] = []
+    pots_after: List[float] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        amts.append(float(action.get("normalized_amount_bb") or 0.0))
+        pots_before.append(float(action.get("pot_before") or 0.0))
+        pots_after.append(float(action.get("pot_after") or 0.0))
+
+    amt_mu, amt_sd, amt_mx = _mean_std_max_norm(amts, max_scale=80.0)
+    pot_mu, pot_sd, pot_mx = _mean_std_max_norm(pots_after, max_scale=200.0)
+    pot_before_mu, pot_before_sd, _ = _mean_std_max_norm(pots_before, max_scale=200.0)
 
     vec: List[float] = [
-        ratio("call"),
-        ratio("check"),
-        # ratio("bet"),
-        ratio("raise"),
-        ratio("fold"),
-        # ratio("all_in"),
-        # ratio("small_blind"),
-        # ratio("big_blind"),
-        # ratio("ante"),
-        ratio("other"),
-        _clamp01(len(counts) / 10.0),
-        _clamp01(len(actions) / 20.0),
-        _clamp01(len(streets) / 4.0),
-        _clamp01(min(len(players), 8) / 8.0),
+        call_ratio,
+        check_ratio,
+        bet_ratio,
+        raise_ratio,
+        fold_ratio,
+        _clamp01(bet_ratio + raise_ratio),
+        _clamp01(call_ratio + check_ratio),
+        street_depth,
+        streets_norm,
+        showdown_flag,
+        player_count_signal,
+        player_count_norm,
+        action_count_norm,
+        unique_streets_norm,
+        amt_mu,
+        amt_sd,
+        amt_mx,
+        pot_mu,
+        pot_sd,
+        pot_mx,
+        pot_before_mu,
+        pot_before_sd,
+        m_ratio("all_in") if "all_in" in action_counts else 0.0,
     ]
 
-    # vec: List[float] = [
-    #     _clamp01(len(counts) / 10.0),
-    #     _clamp01(len(actions) / 20.0),
-    #     _clamp01(len(streets) / 4.0),
-    #     _clamp01(min(len(players), 8) / 8.0),
-    # ]
-    amts, pots_before, pots_after, amounts = [], [], [], []
-    for a in actions:
-        if isinstance(a, dict):
-            amts.append(float(a.get("normalized_amount_bb") or 0.0))
-            pots_before.append(float(a.get("pot_before") or 0.0))
-            pots_after.append(float(a.get("pot_after") or 0.0))
-            amounts.append(float(a.get("amount") or 0.0))
-
-
-    mu, sd = _mean_std_over_max(amts)
-    vec.append(_clamp01(mu))
-    vec.append(_clamp01(sd))
-    mu, sd = _mean_std_over_max(pots_before)
-    vec.append(_clamp01(mu))
-    vec.append(_clamp01(sd))
-    mu, sd = _mean_std_over_max(pots_after)
-    vec.append(_clamp01(mu))
-    vec.append(_clamp01(sd))
-    mu, sd = _mean_std_over_max(amounts)
-    vec.append(_clamp01(mu))
-    vec.append(_clamp01(sd))
-
-
-    # amts = [
-    #     float(a.get("normalized_amount_bb") or 0.0)
-    #     for a in actions
-    #     if isinstance(a, dict)
-    # ]
-    # pots = [float(a.get("pot_after") or 0.0) for a in actions if isinstance(a, dict)]
-
-    # vec.append(_clamp01((np.mean(amts) if amts else 0.0) / 80.0))
-    # vec.append(_clamp01((np.std(amts) if amts else 0.0) / 80.0))
-    # vec.append(_clamp01((np.max(amts) if amts else 0.0) / 80.0))
-    # vec.append(_clamp01((np.mean(pots) if pots else 0.0) / 200.0))
-    # vec.append(_clamp01((np.max(pots) if pots else 0.0) / 200.0))
-    # vec.append(_clamp01(len(actions) / 12.0))
-
-    while len(vec) < HAND_FEATURE_DIM:
-        vec.append(0.0)
-    vec = vec[:HAND_FEATURE_DIM]
-
+    assert len(vec) == HAND_FEATURE_DIM
     return np.asarray(vec, dtype=np.float32)
 
 

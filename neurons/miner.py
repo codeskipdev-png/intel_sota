@@ -3,6 +3,7 @@
 # from __future__ import annotations
 
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Tuple
 
@@ -14,8 +15,11 @@ from poker44.utils.model_manifest import (
     evaluate_manifest_compliance,
     manifest_digest,
 )
-from poker_detect.detect_bots import detect_bots
+from detect_bots import detect_bots
 from poker44.validator.synapse import DetectionSynapse
+import json
+from typing import List, Any
+
 
 class Miner(BaseMinerNeuron):
     """
@@ -30,6 +34,8 @@ class Miner(BaseMinerNeuron):
         super(Miner, self).__init__(config=config)
         bt.logging.info("🤖 Heuristic Poker44 Miner started")
         repo_root = Path(__file__).resolve().parents[1]
+        self.output_dir = repo_root / "output"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=[Path(__file__).resolve()],
@@ -39,7 +45,7 @@ class Miner(BaseMinerNeuron):
                 "framework": "python-heuristic",
                 "license": "MIT",
                 "repo_url": "https://github.com/codeskipdev-png/intel_sota",
-                "repo_commit": "977799a",
+                "repo_commit": "81fa414",
                 "notes": "Reference heuristic miner shipped with the Poker44 subnet.",
                 "open_source": True,
                 "inference_mode": "remote",
@@ -55,6 +61,7 @@ class Miner(BaseMinerNeuron):
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
         self.manifest_digest = manifest_digest(self.model_manifest)
         self._log_manifest_startup(repo_root)
+        self.reqeust_count = 0
         
         # # Attach handlers after initialization
         # self.axon.attach(
@@ -88,9 +95,22 @@ class Miner(BaseMinerNeuron):
             f"miner_doc={repo_root / 'docs' / 'miner.md'}"
         )
 
+    def save_chunks(self, chunks: List[List[dict[str, Any]]]):
+        output_file = self.output_dir / f"chunks_{self.reqeust_count}.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, indent=2, ensure_ascii=False)
+
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         """Assign one deterministic bot-risk score per chunk."""
         chunks = synapse.chunks or []
+        self.reqeust_count += 1
+        print(f"Request count: {self.reqeust_count}")
+
+        # try:
+        #     self.save_chunks(chunks)
+        # except Exception as e:
+        #    print(f"Error saving chunks: {e}")
+        
 
         start_time = time.time()
         risk_scores, predictions = detect_bots(chunks)
