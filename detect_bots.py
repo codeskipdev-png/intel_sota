@@ -75,10 +75,58 @@ def score_summary(scores: List[float]) -> str:
     return _score_summary(scores)
 
 
+def post_process_request(
+    risk_scores: List[float],
+    *,
+    bot_fraction: float = 0.2,
+) -> Tuple[List[float], List[bool]]:
+    """
+    Per-request post-processing: label the top ``round(n * bot_fraction)`` chunks
+    by raw score as bot, then renormalize so bot scores are > 0.5 and human
+    scores are < 0.5 (rank preserved within each group).
+    """
+    n = len(risk_scores)
+    if n == 0:
+        return [], []
+
+    raw = np.asarray(risk_scores, dtype=np.float64)
+    k = min(n, max(0, int(round(n * bot_fraction))))
+
+    order = np.argsort(-raw, kind="stable")
+    is_bot = np.zeros(n, dtype=bool)
+    if k > 0:
+        is_bot[order[:k]] = True
+
+    out = np.empty(n, dtype=np.float64)
+
+    bot_idx = np.flatnonzero(is_bot)
+    if bot_idx.size == 1:
+        out[bot_idx[0]] = max(0.51, min(0.99, float(raw[bot_idx[0]])))
+    elif bot_idx.size > 1:
+        ranked = bot_idx[np.argsort(-raw[bot_idx], kind="stable")]
+        for rank, i in enumerate(ranked):
+            t = rank / (ranked.size - 1)
+            out[i] = 0.51 + t * 0.48
+
+    human_idx = np.flatnonzero(~is_bot)
+    if human_idx.size == 1:
+        out[human_idx[0]] = min(0.49, max(0.01, float(raw[human_idx[0]])))
+    elif human_idx.size > 0:
+        ranked = human_idx[np.argsort(-raw[human_idx], kind="stable")]
+        for rank, i in enumerate(ranked):
+            t = rank / (ranked.size - 1)
+            out[i] = 0.01 + (1.0 - t) * 0.48
+
+    predictions = [bool(b) for b in is_bot]
+    return out.astype(float).tolist(), predictions
+
+
 def detect_bots(
     chunks: List[List[dict[str, Any]]],
     *,
     sanitize: bool = True,
+    post_process: bool = True,
+    bot_fraction: float = 0.2,
 ) -> Tuple[List[float], List[bool]]:
     """
     Score each chunk (list of hand dicts).
@@ -86,9 +134,13 @@ def detect_bots(
     When ``sanitize=True`` (default), hands are passed through
     ``sanitize_hand_for_miner`` so features match training and the live validator.
 
+    When ``post_process=True`` (default), applies ``post_process_request``:
+    top ``round(n * bot_fraction)`` chunks by raw score are labeled bot; scores are
+    renormalized so bots are > 0.5 and humans are < 0.5.
+
     Returns:
-        ``risk_scores`` — float in [0, 1] per chunk (blended + calibrated when configured).
-        ``predictions`` — ``bool(round(risk_score))`` per chunk (subnet convention).
+        ``risk_scores`` — float per chunk (post-processed when enabled).
+        ``predictions`` — ``True`` for bot chunks after post-processing.
     """
     chunk_list = chunks or []
     if not chunk_list:
@@ -99,6 +151,8 @@ def detect_bots(
     for chunk in chunk_list:
         hands = _sanitize_chunk(chunk) if sanitize else [h or {} for h in chunk]
         risk_scores.append(float(scorer.score_chunk(hands)))
+    if post_process:
+        return post_process_request(risk_scores, bot_fraction=bot_fraction)
     predictions = [bool(round(score)) for score in risk_scores]
     return risk_scores, predictions
 
@@ -118,7 +172,7 @@ if __name__ == "__main__":
     path = Path(
         os.environ.get(
             "POKER44_BENCHMARK_JSON",
-            "C:/Users/admin/Documents/workspace/poker/bt_tool/dataset_maker/benchmark_out/benchmark_2026-06-22.json",
+            "C:/Users/admin/Documents/workspace/poker/bt_tool/dataset_maker/benchmark_out/benchmark_2026-06-23.json",
         )
     )
     if not path.exists():
@@ -130,11 +184,30 @@ if __name__ == "__main__":
     for sub_data in data["data"]["chunks"]:
         chunks = sub_data["chunks"]
         ground_truth = sub_data["groundTruth"]
-        risk_scores, predictions = detect_bots(chunks)
-        print(f"scores: {_score_summary(risk_scores)}")
-        print(f"scores: {risk_scores}")
-        rew, metrics = reward(np.asarray(risk_scores, dtype=float), np.asarray(ground_truth))
-        print("=" * 40)
-        print(f"reward={rew:.4f} fpr={metrics['fpr']:.4f} recall={metrics['bot_recall']:.4f}")
-        print(f"predictions={predictions}")
+
+        print("=" * 60)
+        print("WITHOUT post_process")
+        raw_scores, raw_preds = detect_bots(chunks, post_process=False)
+        print(f"scores: {_score_summary(raw_scores)}")
+        print(f"scores: {raw_scores}")
+        raw_rew, raw_metrics = reward(
+            np.asarray(raw_scores, dtype=float), np.asarray(ground_truth)
+        )
+        print(f"reward={raw_rew:.4f} fpr={raw_metrics['fpr']:.4f} recall={raw_metrics['bot_recall']:.4f}")
+        print(f"predictions={raw_preds}")
+        print(f"sum bots={sum(raw_preds)}")
+
+        print("-" * 60)
+        print("WITH post_process")
+        pp_scores, pp_preds = detect_bots(chunks, post_process=True)
+        print(f"scores: {_score_summary(pp_scores)}")
+        print(f"scores: {pp_scores}")
+        pp_rew, pp_metrics = reward(
+            np.asarray(pp_scores, dtype=float), np.asarray(ground_truth)
+        )
+        print(f"reward={pp_rew:.4f} fpr={pp_metrics['fpr']:.4f} recall={pp_metrics['bot_recall']:.4f}")
+        print(f"predictions={pp_preds}")
+        print(f"sum bots={sum(pp_preds)}")
+
         print(f"groundTruth={ground_truth}")
+        print(f"sum groundTruth bots={sum(ground_truth)}")
