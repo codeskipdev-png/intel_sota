@@ -118,7 +118,7 @@ class Miner(BaseMinerNeuron):
         
 
         start_time = time.time()
-        risk_scores, predictions = detect_bots(chunks)
+        risk_scores, predictions = detect_bots(chunks, post_process=False)
         end_time = time.time()
 
         elapsed_time = end_time - start_time
